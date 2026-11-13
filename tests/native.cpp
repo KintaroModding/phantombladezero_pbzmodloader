@@ -11,6 +11,17 @@ void capture(void* context,const FString* name,void* argv) {
     assert(name->count==22 && name->capacity==22);
 }
 int main() {
+    {
+        const U64 call=0x100000000ULL;
+        const Bytes backward={0xe8,0xfb,0xff,0xff,0xff};
+        const Bytes forward={0xe8,0x10,0x00,0x00,0x00};
+        assert(relativeCallTarget(call,backward)==call);
+        assert(relativeCallTarget(call,forward)==call+0x15);
+        bool rejected=false;
+        try { (void)relativeCallTarget(call,Bytes{0x90,0,0,0,0}); }
+        catch(const std::exception&) { rejected=true; }
+        assert(rejected);
+    }
     HANDLE process=GetCurrentProcess();
     auto slab=(U64)VirtualAlloc(nullptr,SLAB_SIZE,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE); assert(slab);
     auto start=startStub(slab,(U64)&capture); write(process,slab,start.data(),start.size());

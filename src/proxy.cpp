@@ -23,8 +23,10 @@ static std::mutex mailLock;
 static std::string mail;
 static std::mutex changedLock;
 static std::set<std::wstring> changedScripts;
-static bool (*originalValidateBytes)(const GameString*,const GameBytes*)=nullptr;
-static bool (*originalValidateText)(const GameString*,const GameString*)=nullptr;
+using ValidateBytesFn = bool (*)(const GameString*,const GameBytes*);
+using ValidateTextFn = bool (*)(const GameString*,const GameString*);
+static std::array<ValidateBytesFn,4> originalValidationBytes{};
+static ValidateTextFn originalValidationText=nullptr;
 static void setMail(std::string message) { std::lock_guard<std::mutex> guard(mailLock); mail=std::move(message); }
 static bool isSlot(const std::wstring& name) {
     auto lower=lowerSlashes(name);
@@ -50,11 +52,14 @@ static void noteChangedScript(const std::wstring& name) {
     std::lock_guard<std::mutex> guard(changedLock);
     if(changedScripts.insert(lowerSlashes(name)).second) log("changed game script allowed: "+utf8(name));
 }
+template<size_t Site>
 static bool validateModBytes(const GameString* path,const GameBytes* source) noexcept {
+    static_assert(Site<4);
     std::wstring name; const bool named=gameString(path,name);
     try { if(named && isSlot(name)) return deliverSlot(source); }
     catch(const std::exception& e) { log(std::string("script slot failed: ")+e.what()); }
-    if(originalValidateBytes(path,source)) return true;
+    auto original=originalValidationBytes[Site];
+    if(original && original(path,source)) return true;
     try {
         if(trustedModBytes(modRoot,path,source)) return true;
         if(named && allowScriptPaks && gameScriptPath(name)) { noteChangedScript(name); return true; }
@@ -64,7 +69,7 @@ static bool validateModBytes(const GameString* path,const GameBytes* source) noe
     return false;
 }
 static bool validateModText(const GameString* path,const GameString* source) noexcept {
-    if(originalValidateText(path,source)) return true;
+    if(originalValidationText && originalValidationText(path,source)) return true;
     std::wstring name; const bool named=gameString(path,name);
     try {
         if(named && isSlot(name) && sameScriptText((const unsigned char*)deliveredScript.data(),deliveredScript.size(),source)) return true;
@@ -218,9 +223,16 @@ extern "C" void pbz_initialize() noexcept {
         try { setMail(mailMessage(0,config(modRoot))); }
         catch(const std::exception& e) { log(std::string("configuration failed: ")+e.what()); setMail(mailError(0,e.what())); }
         const auto base=(U64)GetModuleHandleW(nullptr);
-        originalValidateBytes=reinterpret_cast<decltype(originalValidateBytes)>(base+sites.validateBytes);
-        originalValidateText=reinterpret_cast<decltype(originalValidateText)>(base+sites.validateText);
-        auto installed=install(GetCurrentProcess(),base,image,sites,(U64)&validateModBytes,(U64)&validateModText,slot);
+        const auto validationCalls=captureValidationCalls(GetCurrentProcess(),base,image,sites);
+        for(size_t i=0;i<originalValidationBytes.size();++i)
+            originalValidationBytes[i]=reinterpret_cast<ValidateBytesFn>(validationCalls.targets[i]);
+        originalValidationText=reinterpret_cast<ValidateTextFn>(validationCalls.targets[4]);
+        const std::array<U64,5> validationHooks={{
+            (U64)&validateModBytes<0>,(U64)&validateModBytes<1>,
+            (U64)&validateModBytes<2>,(U64)&validateModBytes<3>,
+            (U64)&validateModText
+        }};
+        auto installed=install(GetCurrentProcess(),base,image,sites,validationCalls,validationHooks,slot);
         log(std::string("script validation adapters installed; slot=")+utf8(slot)+"; embedded script bytes="+std::to_string(embeddedScriptSize)+
             "; changed game scripts="+(allowScriptPaks?"allowed":"not allowed"));
         log("native hooks installed; configuration published");

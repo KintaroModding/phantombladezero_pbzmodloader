@@ -178,6 +178,22 @@ void rel32(Bytes& b,U64 from,U64 to) {
     auto d=(long long)to-(long long)from; if(d<INT32_MIN||d>INT32_MAX) throw std::runtime_error("rel32 out of range"); imm32(b,(int)d);
 }
 void absoluteJump(Bytes& b,U64 target) { b.insert(b.end(),{0xff,0x25,0,0,0,0}); imm64(b,target); }
+U64 relativeCallTarget(U64 address,const Bytes& instruction) {
+    if(instruction.size()!=5 || instruction[0]!=0xe8)
+        throw std::runtime_error("Redirect is not a five-byte CALL rel32");
+    int32_t displacement=0;
+    std::memcpy(&displacement,instruction.data()+1,sizeof(displacement));
+    const auto target=(long long)address+5+(long long)displacement;
+    if(target<=0) throw std::runtime_error("CALL target is invalid");
+    return (U64)target;
+}
+bool executableAddress(U64 address,MEMORY_BASIC_INFORMATION& region) {
+    if(!address || !VirtualQuery((const void*)address,&region,sizeof(region)) ||
+       region.State!=MEM_COMMIT || (region.Protect&(PAGE_NOACCESS|PAGE_GUARD))) return false;
+    const DWORD protection=region.Protect&0xff;
+    return protection==PAGE_EXECUTE || protection==PAGE_EXECUTE_READ ||
+           protection==PAGE_EXECUTE_READWRITE || protection==PAGE_EXECUTE_WRITECOPY;
+}
 #include "signatures.hpp"
 ImageView snapshotImage(HANDLE p,U64 base) {
     IMAGE_DOS_HEADER dos{}; read(p,base,&dos,sizeof(dos));
@@ -249,7 +265,32 @@ Bytes loggerStub(U64 at,U64 ring,U64 original,const Bytes& stolen,bool captureAl
 }
 struct Patch { U64 address; Bytes old; };
 struct Installed { U64 slab=0; std::vector<Patch> patches; };
-Installed install(HANDLE p,U64 base,const ImageView& image,const HookSites& sites,U64 validateBytesHook,U64 validateTextHook,const std::wstring& module) {
+struct ValidationCalls {
+    std::array<Bytes,5> instructions;
+    std::array<U64,5> targets{};
+};
+ValidationCalls captureValidationCalls(HANDLE p,U64 base,const ImageView& image,const HookSites& sites) {
+    ValidationCalls result{};
+    for(size_t i=0;i<sites.validationCalls.size();++i) {
+        const auto at=sites.validationCalls[i];
+        if(!at) throw std::runtime_error("Missing script validation call site; index="+std::to_string(i));
+        const U64 address=base+at;
+        const Bytes snapshot(image.bytes.begin()+at,image.bytes.begin()+at+5);
+        const U64 expectedTarget=base+(i==4?sites.validateText:sites.validateBytes);
+        if(relativeCallTarget(address,snapshot)!=expectedTarget)
+            throw std::runtime_error("Validation call snapshot target disagrees with resolved validator; index="+std::to_string(i));
+        result.instructions[i].resize(5);
+        read(p,address,result.instructions[i].data(),result.instructions[i].size());
+        result.targets[i]=relativeCallTarget(address,result.instructions[i]);
+        MEMORY_BASIC_INFORMATION region{};
+        if(!executableAddress(result.targets[i],region))
+            throw std::runtime_error("Validation CALL target is not committed executable memory; index="+std::to_string(i));
+    }
+    return result;
+}
+Installed install(HANDLE p,U64 base,const ImageView& image,const HookSites& sites,
+                  const ValidationCalls& validationCalls,const std::array<U64,5>& validationHooks,
+                  const std::wstring& module) {
     Installed state;
     // The name lies between the FString at +4128 and the logger ring at +8192.
     if(module.empty() || (module.size()+1)*sizeof(wchar_t)>8192-4160) throw std::runtime_error("Invalid start module name");
@@ -257,18 +298,40 @@ Installed install(HANDLE p,U64 base,const ImageView& image,const HookSites& site
     std::array<Bytes,3> signatures;
     for(int i=0;i<3;++i) signatures[i]=Bytes(image.bytes.begin()+loggers[i],image.bytes.begin()+loggers[i]+7);
     const Bytes originalCall(image.bytes.begin()+sites.call,image.bytes.begin()+sites.call+5);
-    auto verify=[&](U64 addr,const Bytes& expected) { Bytes got(expected.size()); read(p,addr,got.data(),got.size()); if(got!=expected) throw std::runtime_error("Instruction signature mismatch"); };
-    verify(base+sites.call,originalCall);
-    verify(base+sites.start,{0x48,0x8b,0x09,0x48,0x8b,0x01,0x48,0xff,0x20});
-    if(sites.validateBytes && (!validateBytesHook || !validateTextHook)) throw std::runtime_error("Missing script validation adapters");
-    for(auto at:sites.validationCalls) if(at) verify(base+at,Bytes(image.bytes.begin()+at,image.bytes.begin()+at+5));
-    for(int i=0;i<3;++i) verify(base+loggers[i],signatures[i]);
+    const U64 callAddress=base+sites.call;
+    const U64 originalTarget=relativeCallTarget(callAddress,originalCall);
+    if(originalTarget!=base+sites.start)
+        throw std::runtime_error("MainStart CALL target disagrees with resolved thunk");
+    Bytes activeCall(5);
+    read(p,callAddress,activeCall.data(),activeCall.size());
+    const U64 activeTarget=relativeCallTarget(callAddress,activeCall);
+    MEMORY_BASIC_INFORMATION targetRegion{};
+    if(!executableAddress(activeTarget,targetRegion))
+        throw std::runtime_error("MainStart CALL target is not committed executable memory");
+    auto verify=[&](const char* label,U64 addr,const Bytes& expected) {
+        Bytes got(expected.size());
+        read(p,addr,got.data(),got.size());
+        if(got!=expected)
+            throw std::runtime_error(std::string("Instruction signature mismatch; site=")+label);
+    };
+    verify("MainStart thunk",base+sites.start,
+           {0x48,0x8b,0x09,0x48,0x8b,0x01,0x48,0xff,0x20});
+    if(!sites.validateBytes || !sites.validateText)
+        throw std::runtime_error("Missing script validation sites");
+    for(size_t i=0;i<validationHooks.size();++i)
+        if(!validationHooks[i] || !validationCalls.targets[i] || validationCalls.instructions[i].size()!=5)
+            throw std::runtime_error("Missing per-call validation chain; index="+std::to_string(i));
+    for(size_t i=0;i<3;++i) {
+        auto label="Logger "+std::to_string(i);
+        verify(label.c_str(),base+loggers[i],signatures[i]);
+    }
     state.slab=allocateNear(p,base+sites.call);
     try {
-        Bytes blob(3072); auto stub=startStub(state.slab,base+sites.start); std::copy(stub.begin(),stub.end(),blob.begin());
-        if(sites.validateBytes) {
-            Bytes gate; absoluteJump(gate,validateBytesHook); std::copy(gate.begin(),gate.end(),blob.begin()+2048);
-            gate.clear(); absoluteJump(gate,validateTextHook); std::copy(gate.begin(),gate.end(),blob.begin()+2080);
+        Bytes blob(3072); auto stub=startStub(state.slab,activeTarget); std::copy(stub.begin(),stub.end(),blob.begin());
+        // One adapter per call site preserves each pre-existing validation hook chain.
+        for(size_t i=0;i<validationHooks.size();++i) {
+            Bytes gate; absoluteJump(gate,validationHooks[i]);
+            std::copy(gate.begin(),gate.end(),blob.begin()+2048+i*32);
         }
         for(int i=0;i<3;++i) {
             // PuerTS startup errors occur before bootstrap can add our prefix.
@@ -288,20 +351,28 @@ Installed install(HANDLE p,U64 base,const ImageView& image,const HookSites& site
         std::array<Bytes,3> hooks;
         for(int i=0;i<3;++i) { hooks[i]={0xe9}; rel32(hooks[i],base+loggers[i]+5,state.slab+256+i*512); hooks[i].insert(hooks[i].end(),{0x90,0x90}); }
         std::array<Bytes,5> validators;
-        for(size_t i=0;i<validators.size();++i) if(sites.validationCalls[i]) {
-            validators[i]={0xe8}; rel32(validators[i],base+sites.validationCalls[i]+5,state.slab+(i==4?2080:2048));
+        for(size_t i=0;i<validators.size();++i) {
+            validators[i]={0xe8}; rel32(validators[i],base+sites.validationCalls[i]+5,state.slab+2048+i*32);
         }
-        for(size_t i=0;i<validators.size();++i) if(sites.validationCalls[i]) {
+        for(size_t i=0;i<validators.size();++i) {
             auto at=sites.validationCalls[i];
-            state.patches.push_back({base+at,Bytes(image.bytes.begin()+at,image.bytes.begin()+at+5)});
+            Bytes live(5);
+            read(p,base+at,live.data(),live.size());
+            if(live!=validationCalls.instructions[i])
+                throw std::runtime_error("Validation CALL changed during hook install; refusing to overwrite another hook; index="+std::to_string(i));
+            state.patches.push_back({base+at,validationCalls.instructions[i]});
             patch(p,base+at,validators[i]);
         }
         for(int i=0;i<3;++i) {
             state.patches.push_back({base+loggers[i],signatures[i]});
             patch(p,base+loggers[i],hooks[i]);
         }
-        state.patches.push_back({base+sites.call,originalCall});
-        patch(p,base+sites.call,call);
+        Bytes liveCall(5);
+        read(p,callAddress,liveCall.data(),liveCall.size());
+        if(liveCall!=activeCall)
+            throw std::runtime_error("MainStart CALL changed during hook install; refusing to overwrite another hook");
+        state.patches.push_back({callAddress,activeCall});
+        patch(p,callAddress,call);
         return state;
     } catch(...) {
         bool restored=true; for(auto it=state.patches.rbegin();it!=state.patches.rend();++it) try{patch(p,it->address,it->old);}catch(...){restored=false;}
